@@ -2,6 +2,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from datetime import date
 
 from core.data import fetch_prices_alpha_vantage, parse_uploaded_csv
 from core.volatility import realized_vol
@@ -37,10 +38,10 @@ with st.sidebar:
     st.subheader("Marché / Horizon")
     r = st.number_input("Taux sans risque r (annualisé)", value=0.02, step=0.005, format="%.4f")
     q = st.number_input("Dividende q (annualisé)", value=0.00, step=0.005, format="%.4f")
-    T_years = st.number_input("Échéance (années)", value=0.5, min_value=1/252, step=0.25, format="%.4f")
-    n_steps = st.slider("Pas de temps", 20, 1000, 252)
-    n_paths = st.slider("Nombre de trajectoires", 1_000, 200_000, 20_000, step=1_000)
-    seed = st.number_input("Seed (optionnel)", value=42, step=1)
+
+    # La date d'échéance sera choisie plus bas, après chargement des prix (pour connaître la date de valeur).
+    # On affiche juste une info ici :
+    st.caption("La maturité est choisie par date dans la zone centrale (après chargement des prix).")
 
     st.markdown("---")
     st.subheader("Modèle")
@@ -52,22 +53,28 @@ with st.sidebar:
     st.subheader("Payoff")
     payoff_key = st.selectbox("Type de payoff", list(PAYOFFS.keys()))
 
-    # Paramètres spécifiques au payoff
-    # Stability (Range) Digital: paye 'payout' si le sous-jacent reste DANS (B_low, B_high) sur toute la vie (monitoring discret)
+    # Paramètres spécifiques aux payoffs
     if payoff_key == "Stability (Range) Digital":
         B_low = st.number_input("Barrière inférieure Bₗ", value=80.0, step=1.0)
         B_high = st.number_input("Barrière supérieure Bᵤ", value=120.0, step=1.0)
         payout = st.number_input("Payout (Digital)", value=10.0, step=1.0)
-        K = 0.0  # non utilisé par ce payoff, conservé pour la signature
+        K = 0.0  # non utilisé par ce payoff (signature uniforme)
         st.caption("Convention: toucher = knock-out ; monitoring discret aux pas de simulation.")
     else:
         K = st.number_input("Strike K", value=100.0, step=1.0)
         payout = st.number_input("Payout (Digital)", value=1.0, step=0.5)
 
     st.markdown("---")
+    n_steps = st.slider("Pas de temps", 20, 1000, 252)
+    n_paths = st.slider("Nombre de trajectoires", 1_000, 200_000, 20_000, step=1_000)
+    seed = st.number_input("Seed (optionnel)", value=42, step=1)
+
+    st.markdown("---")
     run = st.button("Lancer la simulation / pricing")
 
-# Chargement des prix & estimation vol
+# =========================
+# Chargement des prix
+# =========================
 prices = None
 if src == "Alpha Vantage":
     try:
@@ -81,7 +88,13 @@ else:
         except Exception as e:
             st.error(f"Erreur lecture CSV: {e}")
 
-if prices is not None:
+# =========================
+# Affichage + vol + choix d'échéance par DATE
+# =========================
+valuation_date = None
+T_years = None
+
+if prices is not None and not prices.empty:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Historique")
@@ -97,41 +110,72 @@ if prices is not None:
             sigma = None
             s0 = None
 
-    if run and sigma is not None:
-        # Monte Carlo pricing
-        payoff_kwargs = {}
-        if "Digital" in payoff_key:
-            payoff_kwargs["payout"] = payout
-        if payoff_key == "Stability (Range) Digital":
-            payoff_kwargs["B_low"] = B_low
-            payoff_kwargs["B_high"] = B_high
+    # Choix de maturité par date (à partir de la dernière date disponible)
+    valuation_date = pd.to_datetime(prices.index[-1]).date()
+    st.markdown("---")
+    st.subheader("Échéance (par date)")
+    default_maturity = max(valuation_date, date.today())
+    maturity_date = st.date_input(
+        "Date d'échéance (inclus)",
+        value=default_maturity,
+        min_value=valuation_date,
+        help="La date de valeur est la dernière date de l'historique chargé."
+    )
 
-        price, stderr, paths, payoff = price_mc(
-            s0=s0, r=r, q=q, sigma=sigma, T_years=T_years, n_steps=n_steps,
-            n_paths=n_paths, model_key=model_key, payoff_key=payoff_key, K=K, seed=int(seed), **payoff_kwargs
-        )
+    # Conversion date -> années (base ACT/365.25 simple)
+    delta_days = (pd.to_datetime(maturity_date) - pd.to_datetime(valuation_date)).days
+    T_years = max(delta_days / 365.25, 1/252)  # garde une borne min (~1 jour de marché)
 
-        st.success(f"Prix (MC): {price:,.4f}   ·   IC ~ ± {1.96*stderr:,.4f} (95%)")
+    st.caption(f"Date de valeur: {valuation_date} · Échéance: {maturity_date} · T ≈ {T_years:.4f} an(s)")
 
-        # Graph 1: Trajectoires
-        st.subheader("Trajectoires simulées")
-        n_show = min(200, paths.shape[0])
-        st.line_chart(pd.DataFrame(paths[:n_show, :]).T)
+    # =========================
+    # Lancement MC
+    # =========================
+    if run and sigma is not None and T_years is not None:
+        # Validation basique des bornes pour Stability
+        if payoff_key == "Stability (Range) Digital" and B_low >= B_high:
+            st.error("Borne invalide: B_inf doit être strictement < B_sup.")
+        else:
+            payoff_kwargs = {}
+            if "Digital" in payoff_key:
+                payoff_kwargs["payout"] = payout
+            if payoff_key == "Stability (Range) Digital":
+                payoff_kwargs["B_low"] = B_low
+                payoff_kwargs["B_high"] = B_high
 
-        # Graph 2: Distribution du payoff
-        st.subheader("Distribution du payoff")
-        hist, edges = np.histogram(payoff, bins=50)
-        hist_df = pd.DataFrame({"count": hist}, index=pd.Index([0.5*(edges[i]+edges[i+1]) for i in range(len(hist))], name="payoff"))
-        st.bar_chart(hist_df)
-
-        # Export
-        with st.expander("Exporter les résultats"):
-            df_paths = pd.DataFrame(paths.T)
-            df_paths.index.name = "step"
-            st.download_button("Télécharger les trajectoires (CSV)", df_paths.to_csv().encode(), file_name="paths.csv")
-            st.download_button(
-                "Télécharger les paramètres (TXT)",
-                f"s0={s0}\nr={r}\nq={q}\nsigma={sigma}\nT={T_years}\nsteps={n_steps}\npaths={n_paths}\nmodel={model_key}\n"
-                f"payoff={payoff_key}\nK={K}\n".encode(),
-                file_name="params.txt"
+            price, stderr, paths, payoff = price_mc(
+                s0=s0, r=r, q=q, sigma=sigma, T_years=T_years, n_steps=n_steps,
+                n_paths=n_paths, model_key=model_key, payoff_key=payoff_key, K=K, seed=int(seed), **payoff_kwargs
             )
+
+            st.success(f"Prix (MC): {price:,.4f}   ·   IC ~ ± {1.96*stderr:,.4f} (95%)")
+
+            # Trajectoires
+            st.subheader("Trajectoires simulées")
+            n_show = min(200, paths.shape[0])
+            st.line_chart(pd.DataFrame(paths[:n_show, :]).T)
+
+            # Distribution payoff
+            st.subheader("Distribution du payoff")
+            hist, edges = np.histogram(payoff, bins=50)
+            centers = [0.5*(edges[i]+edges[i+1]) for i in range(len(hist))]
+            hist_df = pd.DataFrame({"count": hist}, index=pd.Index(centers, name="payoff"))
+            st.bar_chart(hist_df)
+
+            # Export
+            with st.expander("Exporter les résultats"):
+                df_paths = pd.DataFrame(paths.T)
+                df_paths.index.name = "step"
+                st.download_button("Télécharger les trajectoires (CSV)", df_paths.to_csv().encode(), file_name="paths.csv")
+
+                params_txt = (
+                    f"s0={s0}\nr={r}\nq={q}\nsigma={sigma}\n"
+                    f"valuation_date={valuation_date}\nmaturity_date={maturity_date}\nT={T_years}\n"
+                    f"steps={n_steps}\npaths={n_paths}\nmodel={model_key}\npayoff={payoff_key}\nK={K}\n"
+                )
+                if payoff_key == "Stability (Range) Digital":
+                    params_txt += f"B_low={B_low}\nB_high={B_high}\npayout={payout}\n"
+                elif "Digital" in payoff_key:
+                    params_txt += f"payout={payout}\n"
+
+                st.download_button("Télécharger les paramètres (TXT)", params_txt.encode(), file_name="params.txt")
