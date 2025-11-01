@@ -43,5 +43,5 @@ PAYOFFS = {
     "Digital Put":   lambda P, K, payout=1.0, **_: digital_put(P, K, payout=payout),
     "Asian (arith) Call": lambda P, K, **_: asian_arith_call(P, K),
     "Asian (arith) Put":  lambda P, K, **_: asian_arith_put(P, K),
-    "Stability Range Digital (stability warant)": lambda P, K, B_low=None, B_high=None, payout=1.0, **_: (stability_range_digital(P, B_low, B_high, payout=payout)),
+    "Stability (Range) Digital": lambda P, K, B_low=None, B_high=None, payout=1.0, **_: (stability_range_digital(P, B_low, B_high, payout=payout)),
 }
