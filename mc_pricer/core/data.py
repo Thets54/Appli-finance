@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import requests
-from key import API_KEY
+from core.key import API_KEY
 
 AV_DAILY_URL = "https://www.alphavantage.co/query"
 
