@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from core.data import fetch_prices_yf, parse_uploaded_csv
+from core.data import fetch_prices_alpha_vantage, parse_uploaded_csv
 from core.volatility import realized_vol
 from core.pricer import price_mc, MODELS
 from core.payoffs import PAYOFFS
@@ -15,11 +15,13 @@ st.caption("V1 – App personnelle (flexible & extensible)")
 
 with st.sidebar:
     st.header("Paramètres généraux")
-    src = st.radio("Source de données", ["Yahoo Finance", "Upload CSV"], horizontal=True)
+    src = st.radio("Source de données", ["Alpha Vantage", "Upload CSV"], horizontal=True)
 
-    if src == "Yahoo Finance":
+    if src == "Alpha Vantage":
         ticker = st.text_input("Ticker (ex: AAPL, MSFT, AIR.PA)", "AAPL")
         hist_months = st.slider("Fenêtre historique (mois)", 6, 24, 12)
+        api_key = st.text_input("API Key Alpha Vantage (optionnel)", value="", type="password")
+        st.caption("Si vide, j’utiliserai la variable d’environnement ALPHAVANTAGE_API_KEY.")
     else:
         up = st.file_uploader("CSV (Date, Price)", type=["csv"])
         date_col = st.text_input("Nom colonne date (optionnel)", "")
@@ -49,21 +51,31 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Payoff")
     payoff_key = st.selectbox("Type de payoff", list(PAYOFFS.keys()))
-    K = st.number_input("Strike K", value=100.0, step=1.0)
-    payout = st.number_input("Payout (Digital)", value=1.0, step=0.5)
+
+    # Paramètres spécifiques au payoff
+    # Stability (Range) Digital: paye 'payout' si le sous-jacent reste DANS (B_low, B_high) sur toute la vie (monitoring discret)
+    if payoff_key == "Stability (Range) Digital":
+        B_low = st.number_input("Barrière inférieure Bₗ", value=80.0, step=1.0)
+        B_high = st.number_input("Barrière supérieure Bᵤ", value=120.0, step=1.0)
+        payout = st.number_input("Payout (Digital)", value=10.0, step=1.0)
+        K = 0.0  # non utilisé par ce payoff, conservé pour la signature
+        st.caption("Convention: toucher = knock-out ; monitoring discret aux pas de simulation.")
+    else:
+        K = st.number_input("Strike K", value=100.0, step=1.0)
+        payout = st.number_input("Payout (Digital)", value=1.0, step=0.5)
 
     st.markdown("---")
     run = st.button("Lancer la simulation / pricing")
 
 # Chargement des prix & estimation vol
 prices = None
-if src == "Yahoo Finance":
+if src == "Alpha Vantage":
     try:
-        prices = fetch_prices_yf(ticker, months=hist_months)
+        prices = fetch_prices_alpha_vantage(ticker, months=hist_months, api_key=(api_key or None))
     except Exception as e:
-        st.error(f"Erreur download YF: {e}")
+        st.error(f"Erreur Alpha Vantage: {e}")
 else:
-    if up is not None:
+    if 'up' in locals() and up is not None:
         try:
             prices = parse_uploaded_csv(up, price_col=price_col or None, date_col=date_col or None)
         except Exception as e:
@@ -90,6 +102,9 @@ if prices is not None:
         payoff_kwargs = {}
         if "Digital" in payoff_key:
             payoff_kwargs["payout"] = payout
+        if payoff_key == "Stability (Range) Digital":
+            payoff_kwargs["B_low"] = B_low
+            payoff_kwargs["B_high"] = B_high
 
         price, stderr, paths, payoff = price_mc(
             s0=s0, r=r, q=q, sigma=sigma, T_years=T_years, n_steps=n_steps,
@@ -103,7 +118,7 @@ if prices is not None:
         n_show = min(200, paths.shape[0])
         st.line_chart(pd.DataFrame(paths[:n_show, :]).T)
 
-        # Graph 2: Distribution terminale
+        # Graph 2: Distribution du payoff
         st.subheader("Distribution du payoff")
         hist, edges = np.histogram(payoff, bins=50)
         hist_df = pd.DataFrame({"count": hist}, index=pd.Index([0.5*(edges[i]+edges[i+1]) for i in range(len(hist))], name="payoff"))
@@ -114,6 +129,9 @@ if prices is not None:
             df_paths = pd.DataFrame(paths.T)
             df_paths.index.name = "step"
             st.download_button("Télécharger les trajectoires (CSV)", df_paths.to_csv().encode(), file_name="paths.csv")
-            st.download_button("Télécharger les paramètres (TXT)", 
-                               f"s0={s0}\nr={r}\nq={q}\nsigma={sigma}\nT={T_years}\nsteps={n_steps}\npaths={n_paths}\nmodel={model_key}\npayoff={payoff_key}\nK={K}\n".encode(),
-                               file_name="params.txt")
+            st.download_button(
+                "Télécharger les paramètres (TXT)",
+                f"s0={s0}\nr={r}\nq={q}\nsigma={sigma}\nT={T_years}\nsteps={n_steps}\npaths={n_paths}\nmodel={model_key}\n"
+                f"payoff={payoff_key}\nK={K}\n".encode(),
+                file_name="params.txt"
+            )
